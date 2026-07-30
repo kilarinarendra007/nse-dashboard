@@ -1,7 +1,7 @@
 """
 NSE Dashboard - Streamlit app
 ------------------------------
-Reads data/nse_data.db (populated by fetch_data.py, refreshed daily by
+Reads data/nse_data_*.db (one SQLite file per quarter, populated by fetch_data.py, refreshed daily by
 a GitHub Action) and displays an interactive dashboard of all NSE
 listed equities: daily Open/High/Low/Close and rolling 52-week
 High/Low.
@@ -18,7 +18,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-DB_PATH = Path(__file__).parent / "data" / "nse_data.db"
+DATA_DIR = Path(__file__).parent / "data"
 
 st.set_page_config(page_title="NSE Dashboard", layout="wide")
 
@@ -28,11 +28,22 @@ st.set_page_config(page_title="NSE Dashboard", layout="wide")
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=600, show_spinner=False)
 def load_data() -> pd.DataFrame:
-    if not DB_PATH.exists():
+    """Data is stored as one SQLite file per quarter (nse_data_2026Q1.db,
+    etc. — see fetch_data.py) to stay under GitHub's 100MB per-file limit.
+    Load and combine all of them here."""
+    db_files = sorted(DATA_DIR.glob("nse_data_*.db"))
+    if not db_files:
         return pd.DataFrame()
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM daily_prices", conn)
-    conn.close()
+
+    frames = []
+    for db_file in db_files:
+        conn = sqlite3.connect(db_file)
+        try:
+            frames.append(pd.read_sql_query("SELECT * FROM daily_prices", conn))
+        finally:
+            conn.close()
+
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if df.empty:
         return df
     df["date"] = pd.to_datetime(df["date"])
@@ -180,7 +191,7 @@ with st.expander("ℹ️ About this dashboard / how to extend it"):
     st.markdown(
         """
         - Data source: NSE's official daily bhavcopy, downloaded by `fetch_data.py`.
-        - A GitHub Action refreshes `data/nse_data.db` automatically after each
+        - A GitHub Action refreshes the `data/nse_data_*.db` files automatically after each
           trading day's close.
         - 52-week High/Low here are computed live from stored history
           (trailing 365 calendar days), not NSE's separate report — so it

@@ -5,11 +5,11 @@ and rolling 52-week High/Low. Built to be extended later.
 
 ## How it works
 - `fetch_data.py` downloads NSE's official daily "bhavcopy" report and stores it
-  in `data/nse_data.db` (SQLite — just a file, no external database needed).
+  in `data/nse_data_*.db` — one SQLite file per quarter, just plain files, no external database needed.
 - `.github/workflows/daily_fetch.yml` runs that script automatically every
   weekday evening and commits the updated database back to this repo, for free,
   using GitHub Actions.
-- `app.py` is a Streamlit dashboard that reads `data/nse_data.db` and displays it,
+- `app.py` is a Streamlit dashboard that reads all the `data/nse_data_*.db` files and displays them,
   computing 52-week high/low on the fly from stored history.
 
 ## One-time setup (10 minutes)
@@ -42,7 +42,7 @@ servers). You can check progress under the Actions tab.
 4. Click **Deploy**
 
 That's it — you'll get a public URL for your dashboard. Every time the GitHub
-Action updates `data/nse_data.db`, the Streamlit app picks up the new data
+Action updates the `data/nse_data_*.db` files, the Streamlit app picks up the new data
 automatically (it refreshes every 10 minutes, or on redeploy).
 
 ## Running locally (optional)

@@ -3,7 +3,7 @@ fetch_data.py
 --------------
 Downloads NSE's official daily "Bhavcopy" (end-of-day report for every
 listed equity: Open, High, Low, Close, Prev Close, Volume, Trades) and
-stores it in a local SQLite database (data/nse_data.db).
+stores it in local SQLite databases, one per quarter (data/nse_data_*.db).
 
 Data source: nseindia.com official bhavcopy files, accessed via the
 open-source `nse` python package (https://pypi.org/project/nse/), which
@@ -38,8 +38,17 @@ from pathlib import Path
 import pandas as pd
 from nse import NSE
 
-DB_PATH = Path(__file__).parent / "data" / "nse_data.db"
-TMP_DOWNLOAD_DIR = Path(__file__).parent / "data" / "_tmp_downloads"
+DATA_DIR = Path(__file__).parent / "data"
+TMP_DOWNLOAD_DIR = DATA_DIR / "_tmp_downloads"
+
+
+def db_path_for(day: datetime) -> Path:
+    """One SQLite file per quarter (e.g. nse_data_2026Q1.db). This keeps
+    each individual file well under GitHub's 100MB per-file limit —
+    a single ever-growing file would eventually exceed that as more
+    days accumulate (a full year already came in at ~107MB)."""
+    quarter = (day.month - 1) // 3 + 1
+    return DATA_DIR / f"nse_data_{day.year}Q{quarter}.db"
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -169,14 +178,12 @@ def main():
     parser.add_argument("--date", help="Single date YYYY-MM-DD (default: today)")
     parser.add_argument("--start", help="Backfill start date YYYY-MM-DD")
     parser.add_argument("--end", help="Backfill end date YYYY-MM-DD")
-    parser.add_argument("--db", default=str(DB_PATH), help="Path to SQLite db file")
     parser.add_argument(
         "--sleep", type=float, default=1.0, help="Seconds to wait between requests"
     )
     args = parser.parse_args()
 
-    db_path = Path(args.db)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     TMP_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.start and args.end:
@@ -187,20 +194,29 @@ def main():
     else:
         start = end = datetime.today()
 
-    conn = sqlite3.connect(db_path)
-    init_db(conn)
+    open_conns = {}  # quarter db path -> open sqlite3 connection
+
+    def get_conn(day: datetime) -> sqlite3.Connection:
+        path = db_path_for(day)
+        if path not in open_conns:
+            c = sqlite3.connect(path)
+            init_db(c)
+            open_conns[path] = c
+        return open_conns[path]
 
     with NSE(download_folder=TMP_DOWNLOAD_DIR) as nse:
         for day in daterange(start, end):
             if day.weekday() >= 5:  # Sat/Sun, NSE is closed
                 print(f"SKIP {day.date()} (weekend)")
                 continue
+            conn = get_conn(day)
             status = fetch_one_day(nse, day, conn)
             print(status)
             time.sleep(args.sleep)
 
-    conn.close()
-    print(f"Done. Database at: {db_path}")
+    for c in open_conns.values():
+        c.close()
+    print(f"Done. {len(open_conns)} quarterly database file(s) updated in {DATA_DIR}")
 
 
 if __name__ == "__main__":
