@@ -2,8 +2,6 @@ name: Daily NSE data fetch
 
 on:
   schedule:
-    # 13:00 UTC = 18:30 IST, Mon-Fri. NSE bhavcopy is usually published
-    # by early evening IST, well before this runs.
     - cron: "0 13 * * 1-5"
   workflow_dispatch:
     inputs:
