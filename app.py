@@ -17,6 +17,7 @@ later means adding one more loader + one more merge, not a rewrite.
 """
 
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -262,7 +263,21 @@ def compute_results_trend(results: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
 
     df = results.copy()
-    df["quarter_end_dt"] = pd.to_datetime(df["quarter_end"], format="%d-%b-%Y", errors="coerce")
+    # Forgiving parse: try a few known formats before falling back to pandas'
+    # generic inference. A too-strict single format can silently drop rows
+    # that use a different format, which would leave a stale "latest"
+    # quarter behind after dropna — worth being defensive here.
+    def _parse_quarter_end(val):
+        if pd.isna(val):
+            return pd.NaT
+        for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%d-%m-%Y", "%Y-%m-%d"):
+            try:
+                return pd.Timestamp(datetime.strptime(str(val).strip(), fmt))
+            except ValueError:
+                continue
+        return pd.to_datetime(val, errors="coerce", dayfirst=True)
+
+    df["quarter_end_dt"] = df["quarter_end"].apply(_parse_quarter_end)
     df = df.dropna(subset=["quarter_end_dt"])
     if df.empty:
         return pd.DataFrame(columns=cols)
@@ -340,9 +355,28 @@ def compute_symbol_history_with_indicators(df: pd.DataFrame, symbol: str) -> pd.
     return hist
 
 
-def style_pct_columns(df: pd.DataFrame):
-    """Color numeric % columns green/red based on sign, and highlight the
-    Results Trend text — pure visual polish, no data changes."""
+def format_indian_large_number(val) -> str:
+    """1,234,567 -> '12.35 L' (Lakh), 123,456,789 -> '12.35 Cr' (Crore) —
+    Indian convention, used for Volume/Trades where raw counts are long
+    and hard to scan."""
+    if pd.isna(val):
+        return ""
+    val = float(val)
+    sign = "-" if val < 0 else ""
+    val = abs(val)
+    if val >= 1_00_00_000:
+        return f"{sign}{val / 1_00_00_000:.2f} Cr"
+    if val >= 1_00_000:
+        return f"{sign}{val / 1_00_000:.2f} L"
+    if val >= 1_000:
+        return f"{sign}{val / 1_000:.2f} K"
+    return f"{sign}{val:.0f}"
+
+
+def style_table(df: pd.DataFrame):
+    """Controls decimal precision, adds Lakh/Crore formatting for large
+    counts, and colors % columns green/red — pure display polish, the
+    underlying values (and sort behavior) are unchanged."""
 
     def _color(val):
         if pd.isna(val) or not isinstance(val, (int, float)):
@@ -353,12 +387,35 @@ def style_pct_columns(df: pd.DataFrame):
             return "color: #B91C1C; font-weight: 600"
         return ""
 
-    pct_cols = [
+    pct_cols = [c for c in ["% Change", "% From 52W High", "QoQ %", "YoY %"] if c in df.columns]
+    price_cols = [
         c
-        for c in ["% Change", "% From 52W High", "QoQ %", "YoY %"]
+        for c in [
+            "Open", "High", "Low", "Close", "Prev Close", "52W High", "52W Low",
+            "VWAP", "SMA20", "SMA50", "SMA200",
+        ]
         if c in df.columns
     ]
-    styler = df.style
+    one_decimal_cols = [c for c in ["Delivery %", "RSI(14)"] if c in df.columns]
+    cr_cols = [c for c in ["Market Cap (Cr)", "Last Qtr Net Profit (Cr)"] if c in df.columns]
+    large_count_cols = [c for c in ["Volume", "Trades"] if c in df.columns]
+    date_cols = [c for c in ["Last Qtr End"] if c in df.columns]
+
+    fmt = {}
+    for c in pct_cols + one_decimal_cols:
+        fmt[c] = "{:.1f}"
+    for c in price_cols:
+        fmt[c] = "{:.2f}"
+    for c in cr_cols:
+        fmt[c] = "{:,.1f}"
+    for c in large_count_cols:
+        fmt[c] = format_indian_large_number
+    for c in date_cols:
+        fmt[c] = lambda v: v.strftime("%d %b %Y") if pd.notna(v) and hasattr(v, "strftime") else (
+            pd.to_datetime(v).strftime("%d %b %Y") if pd.notna(v) else ""
+        )
+
+    styler = df.style.format(fmt, na_rep="—")
     style_fn = styler.map if hasattr(styler, "map") else styler.applymap
     for col in pct_cols:
         styler = style_fn(_color, subset=[col])
@@ -447,6 +504,12 @@ if not quarterly_results.empty:
     )
 else:
     results_trend_filter = []
+
+last5_filter = st.sidebar.selectbox(
+    "Last 5 days trend",
+    ["Any", "Mostly up (3+/5 green)", "Mostly down (3+/5 red)", "All up (5/5 green)", "All down (5/5 red)"],
+    index=0,
+)
 
 scoped_symbols_base = prices.loc[prices["series"].isin(series_filter), "symbol"].unique().tolist()
 if universe_scope == "Top 500 only" and not company_info.empty:
@@ -543,6 +606,18 @@ if mcap_max > 0:
 if results_trend_filter:
     day_df = day_df[day_df["results_trend"].isin(results_trend_filter)]
 
+if last5_filter != "Any":
+    green_count = day_df["trend5"].fillna("").str.count("🟢")
+    red_count = day_df["trend5"].fillna("").str.count("🔴")
+    if last5_filter == "Mostly up (3+/5 green)":
+        day_df = day_df[green_count >= 3]
+    elif last5_filter == "Mostly down (3+/5 red)":
+        day_df = day_df[red_count >= 3]
+    elif last5_filter == "All up (5/5 green)":
+        day_df = day_df[green_count == 5]
+    elif last5_filter == "All down (5/5 red)":
+        day_df = day_df[red_count == 5]
+
 if day_df.empty:
     st.info("No stocks match the current filter combination — try widening one of them.")
     st.stop()
@@ -591,7 +666,7 @@ tab_overview, tab_leaders, tab_screener, tab_chart, tab_about = st.tabs(
 
 with tab_overview:
     st.subheader(f"All {len(table)} stocks — {as_of.strftime('%d %b %Y')}")
-    st.dataframe(style_pct_columns(table), use_container_width=True, height=500)
+    st.dataframe(style_table(table), use_container_width=True, height=500)
 
     st.download_button(
         "⬇️ Download this table as CSV",
@@ -611,7 +686,7 @@ with tab_leaders:
             .sort_values(["Sector", "Market Cap (Cr)"], ascending=[True, False])
         )
         st.dataframe(
-            style_pct_columns(
+            style_table(
                 leaders[["Sector", "Symbol", "Company Name", "Market Cap (Cr)", "Close", "% Change"]]
             ),
             use_container_width=True,
@@ -661,7 +736,7 @@ with tab_screener:
     elif screener_choice == "Results Declined YoY":
         screened = screened[screened["YoY %"] < 0].sort_values("YoY %", ascending=True)
 
-    st.dataframe(style_pct_columns(screened.head(n_results)), use_container_width=True, height=500)
+    st.dataframe(style_table(screened.head(n_results)), use_container_width=True, height=500)
 
 with tab_chart:
     st.subheader("Symbol history")
