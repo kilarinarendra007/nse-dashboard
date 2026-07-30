@@ -81,15 +81,49 @@ def load_delivery() -> pd.DataFrame:
 def load_company_info() -> pd.DataFrame:
     """Sector/industry/shares-outstanding — one small file, not split by
     quarter since it changes rarely. Empty DataFrame if not populated yet."""
+    expected_cols = [
+        "symbol",
+        "company_name",
+        "sector",
+        "industry",
+        "shares_outstanding",
+        "face_value",
+        "last_updated",
+    ]
     if not COMPANY_DB_PATH.exists():
-        return pd.DataFrame()
+        return pd.DataFrame(columns=expected_cols)
     conn = sqlite3.connect(COMPANY_DB_PATH)
     try:
         df = pd.read_sql_query("SELECT * FROM company_info", conn)
     except pd.errors.DatabaseError:
-        df = pd.DataFrame()
+        df = pd.DataFrame(columns=expected_cols)
     finally:
         conn.close()
+    # Guard against an older company_info.db from before a column existed
+    # (e.g. company_name added later) — always guarantee the shape app.py expects.
+    for col in expected_cols:
+        if col not in df.columns:
+            df[col] = None
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_quarterly_results() -> pd.DataFrame:
+    """Last ~5 quarters of revenue/net profit per symbol (NIFTY 500 scope,
+    same as company_info). Empty DataFrame if not populated yet."""
+    expected_cols = ["symbol", "quarter_end", "revenue_lakhs", "net_profit_lakhs", "last_updated"]
+    if not COMPANY_DB_PATH.exists():
+        return pd.DataFrame(columns=expected_cols)
+    conn = sqlite3.connect(COMPANY_DB_PATH)
+    try:
+        df = pd.read_sql_query("SELECT * FROM quarterly_results", conn)
+    except pd.errors.DatabaseError:
+        df = pd.DataFrame(columns=expected_cols)
+    finally:
+        conn.close()
+    for col in expected_cols:
+        if col not in df.columns:
+            df[col] = None
     return df
 
 
@@ -129,6 +163,63 @@ def compute_technical_snapshot(df: pd.DataFrame, as_of: pd.Timestamp) -> pd.Data
     hist["rsi14"] = grouped.transform(_rsi)
     latest = hist.groupby(["symbol", "series"], as_index=False).tail(1)
     return latest[["symbol", "series", "sma20", "sma50", "sma200", "rsi14"]]
+
+
+def compute_results_trend(results: pd.DataFrame) -> pd.DataFrame:
+    """Per symbol: latest quarter's net profit, QoQ % change, YoY % change
+    (vs. the same quarter a year ago, i.e. 4 quarters back), and a
+    Positive/Negative tag. YoY is preferred for the tag since it avoids
+    seasonal noise; falls back to QoQ if a full year of history isn't
+    stored yet."""
+    cols = ["symbol", "latest_quarter_end", "latest_net_profit_cr", "qoq_change_pct", "yoy_change_pct", "results_trend"]
+    if results.empty:
+        return pd.DataFrame(columns=cols)
+
+    df = results.copy()
+    df["quarter_end_dt"] = pd.to_datetime(df["quarter_end"], format="%d-%b-%Y", errors="coerce")
+    df = df.dropna(subset=["quarter_end_dt"])
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    def _per_symbol(g: pd.DataFrame) -> pd.Series:
+        g = g.sort_values("quarter_end_dt")
+        latest = g.iloc[-1]
+        qoq_prior = g.iloc[-2] if len(g) >= 2 else None
+        yoy_prior = g.iloc[-5] if len(g) >= 5 else None
+
+        qoq_pct = None
+        if qoq_prior is not None and qoq_prior["net_profit_lakhs"]:
+            qoq_pct = (latest["net_profit_lakhs"] - qoq_prior["net_profit_lakhs"]) / abs(
+                qoq_prior["net_profit_lakhs"]
+            ) * 100
+
+        yoy_pct = None
+        if yoy_prior is not None and yoy_prior["net_profit_lakhs"]:
+            yoy_pct = (latest["net_profit_lakhs"] - yoy_prior["net_profit_lakhs"]) / abs(
+                yoy_prior["net_profit_lakhs"]
+            ) * 100
+
+        if yoy_pct is not None:
+            trend = "🟢 Positive" if yoy_pct > 0 else "🔴 Negative"
+        elif qoq_pct is not None:
+            trend = "🟢 Positive" if qoq_pct > 0 else "🔴 Negative"
+        else:
+            trend = None
+
+        return pd.Series(
+            {
+                "latest_quarter_end": latest["quarter_end"],
+                "latest_net_profit_cr": round(latest["net_profit_lakhs"] / 100, 1)
+                if pd.notna(latest["net_profit_lakhs"])
+                else None,
+                "qoq_change_pct": round(qoq_pct, 1) if qoq_pct is not None else None,
+                "yoy_change_pct": round(yoy_pct, 1) if yoy_pct is not None else None,
+                "results_trend": trend,
+            }
+        )
+
+    out = df.groupby("symbol").apply(_per_symbol).reset_index()
+    return out
 
 
 def compute_last5_trend(df: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
@@ -179,6 +270,7 @@ if prices.empty:
 
 delivery = load_delivery()
 company_info = load_company_info()
+quarterly_results = load_quarterly_results()
 
 latest_date = prices["date"].max()
 
@@ -197,6 +289,17 @@ all_series = sorted(prices["series"].dropna().unique().tolist())
 default_series = ["EQ"] if "EQ" in all_series else all_series
 series_filter = st.sidebar.multiselect("Series", options=all_series, default=default_series)
 
+universe_scope = st.sidebar.radio(
+    "Universe",
+    ["Top 500 only", "All ~3400 listed stocks"],
+    index=0,
+    help=(
+        "Top 500 = stocks with sector/company data (from fetch_company_info.py). "
+        "The other ~2900 smaller/less-traded listings won't have sector or market cap "
+        "until that enrichment is widened."
+    ),
+)
+
 if not company_info.empty and "sector" in company_info.columns:
     all_sectors = sorted(company_info["sector"].dropna().unique().tolist())
     sector_filter = st.sidebar.multiselect(
@@ -209,7 +312,30 @@ else:
         "sector filtering (see README)."
     )
 
-all_symbols = sorted(prices.loc[prices["series"].isin(series_filter), "symbol"].unique().tolist())
+if not company_info.empty and "industry" in company_info.columns:
+    all_industries = sorted(company_info["industry"].dropna().unique().tolist())
+    industry_filter = st.sidebar.multiselect(
+        "Industry (leave empty for all)", options=all_industries, default=[]
+    )
+else:
+    industry_filter = []
+
+st.sidebar.subheader("Market Cap (₹ Cr)")
+mcap_min = st.sidebar.number_input("Min", min_value=0, value=0, step=1000)
+mcap_max = st.sidebar.number_input("Max (0 = no limit)", min_value=0, value=0, step=1000)
+
+if not quarterly_results.empty:
+    results_trend_filter = st.sidebar.multiselect(
+        "Latest results trend", options=["🟢 Positive", "🔴 Negative"], default=[]
+    )
+else:
+    results_trend_filter = []
+
+scoped_symbols_base = prices.loc[prices["series"].isin(series_filter), "symbol"].unique().tolist()
+if universe_scope == "Top 500 only" and not company_info.empty:
+    top500_set = set(company_info["symbol"].unique())
+    scoped_symbols_base = [s for s in scoped_symbols_base if s in top500_set]
+all_symbols = sorted(scoped_symbols_base)
 symbol_search = st.sidebar.multiselect(
     "Limit to specific symbols (optional, leave empty for all)", options=all_symbols
 )
@@ -226,6 +352,10 @@ col4.metric(
 
 # --- Build the table for the selected date ------------------------------
 day_df = prices[(prices["date"] == as_of) & (prices["series"].isin(series_filter))].copy()
+
+if universe_scope == "Top 500 only" and not company_info.empty:
+    top500_symbols = set(company_info["symbol"].unique())
+    day_df = day_df[day_df["symbol"].isin(top500_symbols)]
 
 if symbol_search:
     day_df = day_df[day_df["symbol"].isin(symbol_search)]
@@ -269,10 +399,30 @@ if not company_info.empty:
 else:
     day_df["company_name"] = None
     day_df["sector"] = None
+    day_df["industry"] = None
     day_df["market_cap_cr"] = None
+
+# Quarterly results trend
+results_trend = compute_results_trend(quarterly_results)
+day_df = day_df.merge(results_trend, on="symbol", how="left")
 
 if sector_filter:
     day_df = day_df[day_df["sector"].isin(sector_filter)]
+
+if industry_filter:
+    day_df = day_df[day_df["industry"].isin(industry_filter)]
+
+if mcap_min > 0:
+    day_df = day_df[day_df["market_cap_cr"] >= mcap_min]
+if mcap_max > 0:
+    day_df = day_df[day_df["market_cap_cr"] <= mcap_max]
+
+if results_trend_filter:
+    day_df = day_df[day_df["results_trend"].isin(results_trend_filter)]
+
+if day_df.empty:
+    st.info("No stocks match the current filter combination — try widening one of them.")
+    st.stop()
 
 day_df["change"] = day_df["close"] - day_df["prev_close"]
 day_df["% change"] = (day_df["change"] / day_df["prev_close"] * 100).round(2)
@@ -283,6 +433,7 @@ display_cols = {
     "company_name": "Company Name",
     "series": "Series",
     "sector": "Sector",
+    "industry": "Industry",
     "open": "Open",
     "high": "High",
     "low": "Low",
@@ -300,6 +451,11 @@ display_cols = {
     "sma200": "SMA200",
     "rsi14": "RSI(14)",
     "market_cap_cr": "Market Cap (Cr)",
+    "results_trend": "Results Trend",
+    "latest_quarter_end": "Last Qtr End",
+    "latest_net_profit_cr": "Last Qtr Net Profit (Cr)",
+    "qoq_change_pct": "QoQ %",
+    "yoy_change_pct": "YoY %",
     "volume": "Volume",
     "trades": "Trades",
 }
@@ -316,6 +472,24 @@ st.download_button(
     mime="text/csv",
 )
 
+# --- Sector Leaders ---------------------------------------------------
+if not company_info.empty and table["Sector"].notna().any():
+    st.subheader("🏆 Sector Leaders (Top 5 by Market Cap)")
+    leaders = table.dropna(subset=["Sector", "Market Cap (Cr)"]).copy()
+    leaders = (
+        leaders.sort_values("Market Cap (Cr)", ascending=False)
+        .groupby("Sector", group_keys=False)
+        .head(5)
+        .sort_values(["Sector", "Market Cap (Cr)"], ascending=[True, False])
+    )
+    st.dataframe(
+        leaders[
+            ["Sector", "Symbol", "Company Name", "Market Cap (Cr)", "Close", "% Change"]
+        ],
+        use_container_width=True,
+        height=400,
+    )
+
 # --- Screener -------------------------------------------------------------
 st.subheader("🔍 Screener")
 screener_choice = st.selectbox(
@@ -328,6 +502,8 @@ screener_choice = st.selectbox(
         "High Delivery %",
         "Oversold (RSI < 30)",
         "Overbought (RSI > 70)",
+        "Results Improved YoY",
+        "Results Declined YoY",
     ],
 )
 n_results = st.slider("Number of results", 5, 100, 20)
@@ -347,6 +523,10 @@ elif screener_choice == "Oversold (RSI < 30)":
     screened = screened[screened["RSI(14)"] < 30].sort_values("RSI(14)", ascending=True)
 elif screener_choice == "Overbought (RSI > 70)":
     screened = screened[screened["RSI(14)"] > 70].sort_values("RSI(14)", ascending=False)
+elif screener_choice == "Results Improved YoY":
+    screened = screened[screened["YoY %"] > 0].sort_values("YoY %", ascending=False)
+elif screener_choice == "Results Declined YoY":
+    screened = screened[screened["YoY %"] < 0].sort_values("YoY %", ascending=True)
 
 st.dataframe(screened.head(n_results), use_container_width=True)
 
@@ -384,8 +564,9 @@ with st.expander("ℹ️ About this dashboard / how to extend it"):
         **Data sources**
         - Daily OHLC: `fetch_data.py` → NSE's official bhavcopy
         - Delivery % / VWAP: `fetch_delivery.py` → NSE's `sec_bhavdata_full` report
-        - Sector / industry / market cap basis: `fetch_company_info.py` → per-symbol
-          NSE lookup, run occasionally (weekly/monthly) since this data changes rarely
+        - Sector / industry / market cap basis / quarterly results: `fetch_company_info.py`
+          → per-symbol NSE lookup, run occasionally (monthly) since this data changes
+          rarely (NIFTY 500 scope — toggle "Universe" in the sidebar)
 
         **Notes**
         - 52-week High/Low are computed live from stored history (trailing 365
@@ -394,6 +575,11 @@ with st.expander("ℹ️ About this dashboard / how to extend it"):
           screening, not identical to every charting platform's exact number.
         - Market Cap is estimated as shares outstanding × close price — treat it
           as approximate, not exchange-verified.
+        - Results Trend compares the latest reported quarter's net profit to the
+          same quarter a year ago (YoY), falling back to the prior quarter (QoQ)
+          if a full year of results history isn't stored yet. This reflects
+          growth vs. the company's own history, not a beat/miss vs. analyst
+          estimates (NSE doesn't publish those for free).
 
         **Adding more later**: each data source above is its own small script +
         its own loader function in this file. To add something new, follow that

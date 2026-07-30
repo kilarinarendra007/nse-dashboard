@@ -1,33 +1,37 @@
 """
 fetch_company_info.py
 ----------------------
-Populates sector/industry classification and share count (for computing
-market cap) for stocks, stored in a single small database:
-data/company_info.db (not split by quarter — this data changes rarely,
-unlike daily prices).
+Populates, for NIFTY 500 constituents, stored in a single small database
+(data/company_info.db — not split by quarter, this data changes rarely):
+  - sector/industry classification and share count (for market cap)
+  - the last ~5 quarters of revenue/net profit (for a Positive/Negative
+    results trend), via NSE's results_comparison() endpoint
 
 Unlike the bhavcopy/delivery reports (one bulk file per day), NSE doesn't
-publish sector or shares-outstanding data in bulk for free. The only way
-to get it is one API call per stock (`getDetailedScripData`), which is
-slow and best run occasionally (weekly/monthly), not daily.
+publish this data in bulk for free. The only way to get it is one API
+call per stock, which is slow and best run occasionally (monthly), not
+daily.
 
 To keep runtime reasonable and avoid hammering NSE's servers, this
 defaults to NIFTY 500 constituents (covers the vast majority of actively
 traded stocks) rather than all ~3400 listed securities. You can widen
 this later — see --index below.
 
-IMPORTANT — this script is best-effort: NSE's per-symbol response format
-isn't officially documented, so this script searches the response
-generically for fields that look like sector/industry/shares-outstanding
-data rather than assuming an exact structure. If your first run reports
-lots of "not found", paste the debug output back and we'll refine the
-field lookup together.
+IMPORTANT — the sector/industry/shares-outstanding lookup is best-effort:
+NSE's per-symbol response format isn't officially documented, so this
+script searches the response generically for fields that look right
+rather than assuming an exact structure. If your first run reports lots
+of "not found", paste the debug output back and we'll refine the field
+lookup together. The results_comparison() field names, by contrast, are
+documented by the library and used as-is.
 
 Usage
 -----
-    python fetch_company_info.py                     # NIFTY 500, default
-    python fetch_company_info.py --index "NIFTY 100"  # smaller/faster run
-    python fetch_company_info.py --debug AAPL         # dump raw response for one symbol
+    python fetch_company_info.py                        # NIFTY 500, default
+    python fetch_company_info.py --index "NIFTY 100"     # smaller/faster run
+    python fetch_company_info.py --skip-results          # sector/market cap only, faster
+    python fetch_company_info.py --debug AAPL             # dump raw getDetailedScripData for one symbol
+    python fetch_company_info.py --debug-results AAPL     # dump raw results_comparison for one symbol
 """
 
 import argparse
@@ -62,6 +66,22 @@ def init_db(conn: sqlite3.Connection) -> None:
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(company_info)")}
     if "company_name" not in existing_cols:
         conn.execute("ALTER TABLE company_info ADD COLUMN company_name TEXT")
+    conn.commit()
+
+
+def init_results_db(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS quarterly_results (
+            symbol            TEXT NOT NULL,
+            quarter_end       TEXT NOT NULL,
+            revenue_lakhs     REAL,
+            net_profit_lakhs  REAL,
+            last_updated      TEXT,
+            PRIMARY KEY (symbol, quarter_end)
+        )
+        """
+    )
     conn.commit()
 
 
@@ -141,6 +161,34 @@ def get_universe(nse: NSE, index_name: str) -> list:
     return symbols
 
 
+def fetch_quarterly_results(nse: NSE, symbol: str, conn: sqlite3.Connection) -> int:
+    """Store the last ~5 quarters of revenue/net profit for `symbol`.
+    Returns the number of quarter rows stored."""
+    data = nse.results_comparison(symbol)
+    rows = data.get("resCmpData", []) if isinstance(data, dict) else []
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    count = 0
+    for row in rows:
+        quarter_end = row.get("re_to_dt")
+        if not quarter_end:
+            continue
+        conn.execute(
+            """
+            INSERT INTO quarterly_results
+                (symbol, quarter_end, revenue_lakhs, net_profit_lakhs, last_updated)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(symbol, quarter_end) DO UPDATE SET
+                revenue_lakhs=excluded.revenue_lakhs,
+                net_profit_lakhs=excluded.net_profit_lakhs,
+                last_updated=excluded.last_updated
+            """,
+            (symbol, quarter_end, row.get("re_total_inc"), row.get("re_net_profit"), today),
+        )
+        count += 1
+    conn.commit()
+    return count
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Fetch sector/industry/shares-outstanding per symbol (slow, run occasionally)"
@@ -158,6 +206,16 @@ def main():
         metavar="SYMBOL",
         help="Print the raw NSE response for one symbol and exit (for troubleshooting field names)",
     )
+    parser.add_argument(
+        "--debug-results",
+        metavar="SYMBOL",
+        help="Print the raw results_comparison() response for one symbol and exit",
+    )
+    parser.add_argument(
+        "--skip-results",
+        action="store_true",
+        help="Skip the quarterly results fetch (sector/market cap only, faster)",
+    )
     args = parser.parse_args()
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -171,13 +229,22 @@ def main():
             print(json.dumps(raw, indent=2)[:5000])
             return
 
+        if args.debug_results:
+            import json
+
+            raw = nse.results_comparison(args.debug_results)
+            print(json.dumps(raw, indent=2)[:5000])
+            return
+
         symbols = get_universe(nse, args.index)
         print(f"Found {len(symbols)} symbols in {args.index}")
 
         conn = sqlite3.connect(COMPANY_DB_PATH)
         init_db(conn)
+        init_results_db(conn)
 
         found_count = 0
+        results_count = 0
         for i, symbol in enumerate(symbols, 1):
             try:
                 raw = nse.getDetailedScripData(symbol)
@@ -213,9 +280,20 @@ def main():
                 print(f"[{i}/{len(symbols)}] SKIP {symbol}: {e}")
             time.sleep(args.sleep)
 
+            if not args.skip_results:
+                try:
+                    n = fetch_quarterly_results(nse, symbol, conn)
+                    if n:
+                        results_count += 1
+                    print(f"[{i}/{len(symbols)}]   -> results: {n} quarter(s) stored")
+                except Exception as e:  # noqa: BLE001
+                    print(f"[{i}/{len(symbols)}]   -> results SKIP: {e}")
+                time.sleep(args.sleep)
+
         conn.close()
         print(
-            f"Done. {found_count}/{len(symbols)} symbols had usable sector/shares data. "
+            f"Done. {found_count}/{len(symbols)} symbols had usable sector/shares data, "
+            f"{results_count}/{len(symbols)} had quarterly results data. "
             f"Database at: {COMPANY_DB_PATH}"
         )
         if found_count == 0:
