@@ -49,6 +49,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS company_info (
             symbol              TEXT PRIMARY KEY,
+            company_name        TEXT,
             sector              TEXT,
             industry            TEXT,
             shares_outstanding  REAL,
@@ -57,36 +58,64 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # migration for a company_info.db created before company_name existed
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(company_info)")}
+    if "company_name" not in existing_cols:
+        conn.execute("ALTER TABLE company_info ADD COLUMN company_name TEXT")
     conn.commit()
 
 
-def _recursive_find(obj, keywords, path=""):
-    """Recursively search a nested dict/list for the first key whose name
-    contains any of `keywords` (case-insensitive substring match).
-    Returns (matched_path, value) or (None, None)."""
+def _find_all(obj, keywords, path=""):
+    """Recursively search a nested dict/list and yield EVERY (path, value)
+    where the key name contains any of `keywords` (case-insensitive
+    substring match) and the value is a plain scalar. Yields every match
+    in the tree rather than stopping at the first — some NSE responses
+    have more than one field whose name matches a keyword, and the first
+    one found isn't always the useful one (e.g. a 'sector' key that's
+    really an internal index-name lookup)."""
     if isinstance(obj, dict):
         for k, v in obj.items():
             k_lower = k.lower()
             if any(kw in k_lower for kw in keywords) and not isinstance(v, (dict, list)):
-                return f"{path}.{k}", v
+                yield f"{path}.{k}", v
         for k, v in obj.items():
-            found_path, found_val = _recursive_find(v, keywords, f"{path}.{k}")
-            if found_path is not None:
-                return found_path, found_val
+            yield from _find_all(v, keywords, f"{path}.{k}")
     elif isinstance(obj, list):
         for i, item in enumerate(obj):
-            found_path, found_val = _recursive_find(item, keywords, f"{path}[{i}]")
-            if found_path is not None:
-                return found_path, found_val
-    return None, None
+            yield from _find_all(item, keywords, f"{path}[{i}]")
+
+
+def _looks_like_junk(value) -> bool:
+    """Reject values that look like an internal index-name lookup (e.g.
+    'NIFTY AUTO                    ') rather than a genuine
+    sector/industry classification."""
+    if value is None:
+        return True
+    s = str(value).strip()
+    if not s or s == "-":
+        return True
+    if "NIFTY" in s.upper():
+        return True
+    return False
+
+
+def _first_clean_match(raw: dict, keywords) -> str | None:
+    for _, value in _find_all(raw, keywords):
+        if not _looks_like_junk(value):
+            return str(value).strip()
+    return None
 
 
 def extract_company_fields(raw: dict) -> dict:
-    _, sector = _recursive_find(raw, ["sector", "macro"])
-    _, industry = _recursive_find(raw, ["industry", "basicindustry"])
-    _, shares = _recursive_find(raw, ["issuedsize", "sharesoutstanding", "issuedcap"])
-    _, face_value = _recursive_find(raw, ["facevalue"])
+    company_name = _first_clean_match(raw, ["companyname"])
+    sector = _first_clean_match(raw, ["sector", "macro"])
+    industry = _first_clean_match(raw, ["industry", "basicindustry"])
+    _, shares = next(
+        iter(_find_all(raw, ["issuedsize", "sharesoutstanding", "issuedcap"])), (None, None)
+    )
+    _, face_value = next(iter(_find_all(raw, ["facevalue"])), (None, None))
     return {
+        "company_name": company_name,
         "sector": sector,
         "industry": industry,
         "shares_outstanding": shares,
@@ -146,14 +175,15 @@ def main():
             try:
                 raw = nse.getDetailedScripData(symbol)
                 fields = extract_company_fields(raw)
-                if fields["sector"] or fields["shares_outstanding"]:
+                if fields["sector"] or fields["shares_outstanding"] or fields["company_name"]:
                     found_count += 1
                 conn.execute(
                     """
                     INSERT INTO company_info
-                        (symbol, sector, industry, shares_outstanding, face_value, last_updated)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (symbol, company_name, sector, industry, shares_outstanding, face_value, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(symbol) DO UPDATE SET
+                        company_name=excluded.company_name,
                         sector=excluded.sector,
                         industry=excluded.industry,
                         shares_outstanding=excluded.shares_outstanding,
@@ -162,6 +192,7 @@ def main():
                     """,
                     (
                         symbol,
+                        fields["company_name"],
                         fields["sector"],
                         fields["industry"],
                         fields["shares_outstanding"],

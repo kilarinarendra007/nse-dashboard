@@ -131,6 +131,28 @@ def compute_technical_snapshot(df: pd.DataFrame, as_of: pd.Timestamp) -> pd.Data
     return latest[["symbol", "series", "sma20", "sma50", "sma200", "rsi14"]]
 
 
+def compute_last5_trend(df: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
+    """Last up-to-5 trading days' up/down direction per symbol, as a
+    small string of green/red squares (oldest -> newest, left to right)."""
+    hist = df[df["date"] <= as_of].sort_values(["symbol", "series", "date"]).copy()
+    if hist.empty:
+        return pd.DataFrame(columns=["symbol", "series", "trend5"])
+    hist["chg"] = hist.groupby(["symbol", "series"])["close"].diff()
+    last5 = hist.groupby(["symbol", "series"], as_index=False).tail(5)
+
+    def _emoji(x):
+        if pd.isna(x):
+            return "⬜"
+        return "🟢" if x > 0 else ("🔴" if x < 0 else "⬜")
+
+    trend = (
+        last5.groupby(["symbol", "series"])["chg"]
+        .apply(lambda s: "".join(_emoji(x) for x in s))
+        .reset_index(name="trend5")
+    )
+    return trend
+
+
 def compute_symbol_history_with_indicators(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     """Full time series + rolling indicators for one symbol, for the chart."""
     hist = df[df["symbol"] == symbol].sort_values("date").copy()
@@ -234,6 +256,10 @@ else:
 tech = compute_technical_snapshot(prices[prices["series"].isin(series_filter)], as_of)
 day_df = day_df.merge(tech, on=["symbol", "series"], how="left")
 
+# Last 5 days up/down trend
+trend5 = compute_last5_trend(prices[prices["series"].isin(series_filter)], as_of)
+day_df = day_df.merge(trend5, on=["symbol", "series"], how="left")
+
 # Sector / market cap
 if not company_info.empty:
     day_df = day_df.merge(company_info, on="symbol", how="left")
@@ -241,6 +267,7 @@ if not company_info.empty:
         day_df["shares_outstanding"] * day_df["close"] / 1e7
     ).round(1)  # in INR crores
 else:
+    day_df["company_name"] = None
     day_df["sector"] = None
     day_df["market_cap_cr"] = None
 
@@ -253,6 +280,7 @@ day_df["% from 52W high"] = ((day_df["close"] - day_df["w52_high"]) / day_df["w5
 
 display_cols = {
     "symbol": "Symbol",
+    "company_name": "Company Name",
     "series": "Series",
     "sector": "Sector",
     "open": "Open",
@@ -261,6 +289,7 @@ display_cols = {
     "close": "Close",
     "prev_close": "Prev Close",
     "% change": "% Change",
+    "trend5": "Last 5D",
     "w52_high": "52W High",
     "w52_low": "52W Low",
     "% from 52W high": "% From 52W High",
