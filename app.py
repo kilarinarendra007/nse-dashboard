@@ -26,7 +26,32 @@ import streamlit as st
 DATA_DIR = Path(__file__).parent / "data"
 COMPANY_DB_PATH = DATA_DIR / "company_info.db"
 
-st.set_page_config(page_title="NSE Dashboard", layout="wide")
+st.set_page_config(page_title="NSE Dashboard", page_icon="📈", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    .block-container { padding-top: 2rem; padding-bottom: 3rem; }
+    h1 { font-weight: 700; letter-spacing: -0.02em; }
+    h2, h3 { font-weight: 600; letter-spacing: -0.01em; }
+    [data-testid="stMetric"] {
+        background: #F8FAFA;
+        border: 1px solid #E2E8E7;
+        border-radius: 10px;
+        padding: 14px 16px 10px 16px;
+    }
+    [data-testid="stMetricLabel"] { font-size: 0.8rem; color: #5B6B69; }
+    div[data-testid="stDataFrame"] { border: 1px solid #E2E8E7; border-radius: 10px; overflow: hidden; }
+    .stTabs [data-baseweb="tab-list"] { gap: 4px; }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px 8px 0 0;
+        padding: 8px 18px;
+        font-weight: 600;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -127,9 +152,70 @@ def load_quarterly_results() -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_corporate_actions() -> pd.DataFrame:
+    """Bonus/split events with a parsed adjustment_factor, whole market
+    (not just Top 500) — fetch_corporate_actions.py. Empty DataFrame if
+    not populated yet."""
+    expected_cols = ["symbol", "series", "ex_date", "subject", "adjustment_factor", "last_updated"]
+    if not COMPANY_DB_PATH.exists():
+        return pd.DataFrame(columns=expected_cols)
+    conn = sqlite3.connect(COMPANY_DB_PATH)
+    try:
+        df = pd.read_sql_query("SELECT * FROM corporate_actions", conn)
+    except pd.errors.DatabaseError:
+        df = pd.DataFrame(columns=expected_cols)
+    finally:
+        conn.close()
+    for col in expected_cols:
+        if col not in df.columns:
+            df[col] = None
+    if not df.empty:
+        df["ex_date"] = pd.to_datetime(df["ex_date"])
+        df = df.dropna(subset=["adjustment_factor"])  # only rows we could confidently parse
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Derived data
 # ---------------------------------------------------------------------------
+def build_adjusted_prices(prices: pd.DataFrame, actions: pd.DataFrame) -> pd.DataFrame:
+    """Returns a copy of `prices` with open/high/low/close back-adjusted
+    for bonus/split corporate actions, so 52-week high/low, moving
+    averages, and RSI reflect prices that are actually comparable across
+    time. This does NOT change what's shown for any single day's actual
+    OHLC in the main table — only the cross-time comparisons that use
+    this adjusted copy.
+
+    Standard back-adjustment: today's price is unchanged; each historical
+    price is multiplied by the cumulative product of every action's
+    factor between that date and today.
+    """
+    if actions.empty:
+        return prices
+
+    df = prices.copy()
+    df["_adj_factor"] = 1.0
+
+    for symbol, grp in actions.groupby("symbol"):
+        sym_mask = df["symbol"] == symbol
+        if not sym_mask.any():
+            continue
+        sym_dates = df.loc[sym_mask, "date"]
+        action_list = sorted(zip(grp["ex_date"], grp["adjustment_factor"]), reverse=True)
+
+        multiplier = pd.Series(1.0, index=sym_dates.index)
+        cum = 1.0
+        for ex_date, factor in action_list:
+            cum *= factor
+            multiplier[sym_dates < ex_date] = cum
+        df.loc[sym_mask, "_adj_factor"] = multiplier
+
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col] * df["_adj_factor"]
+    return df.drop(columns=["_adj_factor"])
+
+
 def compute_52w_high_low(df: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
     window_start = as_of - pd.Timedelta(days=365)
     window = df[(df["date"] > window_start) & (df["date"] <= as_of)]
@@ -254,10 +340,37 @@ def compute_symbol_history_with_indicators(df: pd.DataFrame, symbol: str) -> pd.
     return hist
 
 
+def style_pct_columns(df: pd.DataFrame):
+    """Color numeric % columns green/red based on sign, and highlight the
+    Results Trend text — pure visual polish, no data changes."""
+
+    def _color(val):
+        if pd.isna(val) or not isinstance(val, (int, float)):
+            return ""
+        if val > 0:
+            return "color: #15803D; font-weight: 600"
+        if val < 0:
+            return "color: #B91C1C; font-weight: 600"
+        return ""
+
+    pct_cols = [
+        c
+        for c in ["% Change", "% From 52W High", "QoQ %", "YoY %"]
+        if c in df.columns
+    ]
+    styler = df.style
+    style_fn = styler.map if hasattr(styler, "map") else styler.applymap
+    for col in pct_cols:
+        styler = style_fn(_color, subset=[col])
+        style_fn = styler.map if hasattr(styler, "map") else styler.applymap
+    return styler
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 st.title("📈 NSE Stock Dashboard")
+st.caption("Daily prices, delivery %, sector data, technical indicators and a screener — built on NSE's official data.")
 
 prices = load_prices()
 
@@ -271,6 +384,7 @@ if prices.empty:
 delivery = load_delivery()
 company_info = load_company_info()
 quarterly_results = load_quarterly_results()
+corporate_actions = load_corporate_actions()
 
 latest_date = prices["date"].max()
 
@@ -313,7 +427,10 @@ else:
     )
 
 if not company_info.empty and "industry" in company_info.columns:
-    all_industries = sorted(company_info["industry"].dropna().unique().tolist())
+    industry_pool = company_info
+    if sector_filter:
+        industry_pool = industry_pool[industry_pool["sector"].isin(sector_filter)]
+    all_industries = sorted(industry_pool["industry"].dropna().unique().tolist())
     industry_filter = st.sidebar.multiselect(
         "Industry (leave empty for all)", options=all_industries, default=[]
     )
@@ -350,6 +467,12 @@ col4.metric(
     f"{company_info['symbol'].nunique()}" if not company_info.empty else "0",
 )
 
+# Back-adjusted for bonus/split — used for 52W high/low, moving averages, RSI,
+# and the chart, so a stock's historical numbers stay comparable to today's
+# price. The main table's own Open/High/Low/Close for a given day (below)
+# intentionally stays UNADJUSTED — that's the actual price that day.
+prices_adj = build_adjusted_prices(prices, corporate_actions)
+
 # --- Build the table for the selected date ------------------------------
 day_df = prices[(prices["date"] == as_of) & (prices["series"].isin(series_filter))].copy()
 
@@ -368,7 +491,7 @@ if day_df.empty:
     st.stop()
 
 # 52W high/low
-w52 = compute_52w_high_low(prices[prices["series"].isin(series_filter)], as_of)
+w52 = compute_52w_high_low(prices_adj[prices_adj["series"].isin(series_filter)], as_of)
 day_df = day_df.merge(w52, on=["symbol", "series"], how="left")
 
 # Delivery % / VWAP for this date
@@ -383,11 +506,11 @@ else:
     day_df["avg_price"] = None
 
 # Technical indicators
-tech = compute_technical_snapshot(prices[prices["series"].isin(series_filter)], as_of)
+tech = compute_technical_snapshot(prices_adj[prices_adj["series"].isin(series_filter)], as_of)
 day_df = day_df.merge(tech, on=["symbol", "series"], how="left")
 
 # Last 5 days up/down trend
-trend5 = compute_last5_trend(prices[prices["series"].isin(series_filter)], as_of)
+trend5 = compute_last5_trend(prices_adj[prices_adj["series"].isin(series_filter)], as_of)
 day_df = day_df.merge(trend5, on=["symbol", "series"], how="left")
 
 # Sector / market cap
@@ -462,103 +585,125 @@ display_cols = {
 table = day_df[list(display_cols.keys())].rename(columns=display_cols)
 table = table.sort_values("Symbol").reset_index(drop=True)
 
-st.subheader(f"All {len(table)} stocks — {as_of.strftime('%d %b %Y')}")
-st.dataframe(table, use_container_width=True, height=500)
-
-st.download_button(
-    "⬇️ Download this table as CSV",
-    data=table.to_csv(index=False).encode("utf-8"),
-    file_name=f"nse_{as_of.strftime('%Y%m%d')}.csv",
-    mime="text/csv",
+tab_overview, tab_leaders, tab_screener, tab_chart, tab_about = st.tabs(
+    ["📊 Overview", "🏆 Sector Leaders", "🔍 Screener", "📈 Chart", "ℹ️ About"]
 )
 
-# --- Sector Leaders ---------------------------------------------------
-if not company_info.empty and table["Sector"].notna().any():
-    st.subheader("🏆 Sector Leaders (Top 5 by Market Cap)")
-    leaders = table.dropna(subset=["Sector", "Market Cap (Cr)"]).copy()
-    leaders = (
-        leaders.sort_values("Market Cap (Cr)", ascending=False)
-        .groupby("Sector", group_keys=False)
-        .head(5)
-        .sort_values(["Sector", "Market Cap (Cr)"], ascending=[True, False])
+with tab_overview:
+    st.subheader(f"All {len(table)} stocks — {as_of.strftime('%d %b %Y')}")
+    st.dataframe(style_pct_columns(table), use_container_width=True, height=500)
+
+    st.download_button(
+        "⬇️ Download this table as CSV",
+        data=table.to_csv(index=False).encode("utf-8"),
+        file_name=f"nse_{as_of.strftime('%Y%m%d')}.csv",
+        mime="text/csv",
     )
-    st.dataframe(
-        leaders[
-            ["Sector", "Symbol", "Company Name", "Market Cap (Cr)", "Close", "% Change"]
+
+with tab_leaders:
+    if not company_info.empty and table["Sector"].notna().any():
+        st.subheader("🏆 Sector Leaders (Top 5 by Market Cap)")
+        leaders = table.dropna(subset=["Sector", "Market Cap (Cr)"]).copy()
+        leaders = (
+            leaders.sort_values("Market Cap (Cr)", ascending=False)
+            .groupby("Sector", group_keys=False)
+            .head(5)
+            .sort_values(["Sector", "Market Cap (Cr)"], ascending=[True, False])
+        )
+        st.dataframe(
+            style_pct_columns(
+                leaders[["Sector", "Symbol", "Company Name", "Market Cap (Cr)", "Close", "% Change"]]
+            ),
+            use_container_width=True,
+            height=500,
+        )
+    else:
+        st.info(
+            "No sector data loaded yet — run `python fetch_company_info.py` once to enable this "
+            "(see README)."
+        )
+
+with tab_screener:
+    st.subheader("🔍 Screener")
+    screener_choice = st.selectbox(
+        "Preset",
+        [
+            "Top Gainers",
+            "Top Losers",
+            "Near 52W High",
+            "Near 52W Low",
+            "High Delivery %",
+            "Oversold (RSI < 30)",
+            "Overbought (RSI > 70)",
+            "Results Improved YoY",
+            "Results Declined YoY",
         ],
-        use_container_width=True,
-        height=400,
+    )
+    n_results = st.slider("Number of results", 5, 100, 20)
+
+    screened = table.copy()
+    if screener_choice == "Top Gainers":
+        screened = screened.sort_values("% Change", ascending=False)
+    elif screener_choice == "Top Losers":
+        screened = screened.sort_values("% Change", ascending=True)
+    elif screener_choice == "Near 52W High":
+        screened = screened.sort_values("% From 52W High", ascending=False)
+    elif screener_choice == "Near 52W Low":
+        screened = screened.sort_values("% From 52W High", ascending=True)
+    elif screener_choice == "High Delivery %":
+        screened = screened.sort_values("Delivery %", ascending=False)
+    elif screener_choice == "Oversold (RSI < 30)":
+        screened = screened[screened["RSI(14)"] < 30].sort_values("RSI(14)", ascending=True)
+    elif screener_choice == "Overbought (RSI > 70)":
+        screened = screened[screened["RSI(14)"] > 70].sort_values("RSI(14)", ascending=False)
+    elif screener_choice == "Results Improved YoY":
+        screened = screened[screened["YoY %"] > 0].sort_values("YoY %", ascending=False)
+    elif screener_choice == "Results Declined YoY":
+        screened = screened[screened["YoY %"] < 0].sort_values("YoY %", ascending=True)
+
+    st.dataframe(style_pct_columns(screened.head(n_results)), use_container_width=True, height=500)
+
+with tab_chart:
+    st.subheader("Symbol history")
+    chosen = st.selectbox("Pick a symbol to chart", options=table["Symbol"].tolist())
+
+    hist = compute_symbol_history_with_indicators(
+        prices_adj[(prices_adj["series"].isin(series_filter)) & (prices_adj["date"] <= as_of)], chosen
     )
 
-# --- Screener -------------------------------------------------------------
-st.subheader("🔍 Screener")
-screener_choice = st.selectbox(
-    "Preset",
-    [
-        "Top Gainers",
-        "Top Losers",
-        "Near 52W High",
-        "Near 52W Low",
-        "High Delivery %",
-        "Oversold (RSI < 30)",
-        "Overbought (RSI > 70)",
-        "Results Improved YoY",
-        "Results Declined YoY",
-    ],
-)
-n_results = st.slider("Number of results", 5, 100, 20)
+    if not hist.empty:
+        row = w52[w52["symbol"] == chosen]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=hist["date"], y=hist["close"], mode="lines", name="Close", line=dict(color="#0F766E", width=2)))
+        fig.add_trace(go.Scatter(x=hist["date"], y=hist["sma20"], mode="lines", name="SMA20", line=dict(dash="dash")))
+        fig.add_trace(go.Scatter(x=hist["date"], y=hist["sma50"], mode="lines", name="SMA50", line=dict(dash="dash")))
+        fig.add_trace(go.Scatter(x=hist["date"], y=hist["sma200"], mode="lines", name="SMA200", line=dict(dash="dash")))
+        if not row.empty:
+            fig.add_hline(y=row["w52_high"].iloc[0], line_dash="dot", annotation_text="52W High", line_color="#15803D")
+            fig.add_hline(y=row["w52_low"].iloc[0], line_dash="dot", annotation_text="52W Low", line_color="#B91C1C")
+        fig.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=30, b=10),
+            legend=dict(orientation="h"),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-screened = table.copy()
-if screener_choice == "Top Gainers":
-    screened = screened.sort_values("% Change", ascending=False)
-elif screener_choice == "Top Losers":
-    screened = screened.sort_values("% Change", ascending=True)
-elif screener_choice == "Near 52W High":
-    screened = screened.sort_values("% From 52W High", ascending=False)
-elif screener_choice == "Near 52W Low":
-    screened = screened.sort_values("% From 52W High", ascending=True)
-elif screener_choice == "High Delivery %":
-    screened = screened.sort_values("Delivery %", ascending=False)
-elif screener_choice == "Oversold (RSI < 30)":
-    screened = screened[screened["RSI(14)"] < 30].sort_values("RSI(14)", ascending=True)
-elif screener_choice == "Overbought (RSI > 70)":
-    screened = screened[screened["RSI(14)"] > 70].sort_values("RSI(14)", ascending=False)
-elif screener_choice == "Results Improved YoY":
-    screened = screened[screened["YoY %"] > 0].sort_values("YoY %", ascending=False)
-elif screener_choice == "Results Declined YoY":
-    screened = screened[screened["YoY %"] < 0].sort_values("YoY %", ascending=True)
+        rsi_fig = go.Figure()
+        rsi_fig.add_trace(go.Scatter(x=hist["date"], y=hist["rsi14"], mode="lines", name="RSI(14)", line=dict(color="#0F766E")))
+        rsi_fig.add_hline(y=70, line_dash="dot", line_color="#B91C1C")
+        rsi_fig.add_hline(y=30, line_dash="dot", line_color="#15803D")
+        rsi_fig.update_layout(
+            height=180,
+            margin=dict(l=10, r=10, t=10, b=10),
+            yaxis_range=[0, 100],
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        st.plotly_chart(rsi_fig, use_container_width=True)
 
-st.dataframe(screened.head(n_results), use_container_width=True)
-
-# --- Drill-down chart for one symbol -------------------------------------
-st.subheader("Symbol history")
-chosen = st.selectbox("Pick a symbol to chart", options=table["Symbol"].tolist())
-
-hist = compute_symbol_history_with_indicators(
-    prices[(prices["series"].isin(series_filter)) & (prices["date"] <= as_of)], chosen
-)
-
-if not hist.empty:
-    row = w52[w52["symbol"] == chosen]
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=hist["date"], y=hist["close"], mode="lines", name="Close"))
-    fig.add_trace(go.Scatter(x=hist["date"], y=hist["sma20"], mode="lines", name="SMA20", line=dict(dash="dash")))
-    fig.add_trace(go.Scatter(x=hist["date"], y=hist["sma50"], mode="lines", name="SMA50", line=dict(dash="dash")))
-    fig.add_trace(go.Scatter(x=hist["date"], y=hist["sma200"], mode="lines", name="SMA200", line=dict(dash="dash")))
-    if not row.empty:
-        fig.add_hline(y=row["w52_high"].iloc[0], line_dash="dot", annotation_text="52W High", line_color="green")
-        fig.add_hline(y=row["w52_low"].iloc[0], line_dash="dot", annotation_text="52W Low", line_color="red")
-    fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
-    st.plotly_chart(fig, use_container_width=True)
-
-    rsi_fig = go.Figure()
-    rsi_fig.add_trace(go.Scatter(x=hist["date"], y=hist["rsi14"], mode="lines", name="RSI(14)"))
-    rsi_fig.add_hline(y=70, line_dash="dot", line_color="red")
-    rsi_fig.add_hline(y=30, line_dash="dot", line_color="green")
-    rsi_fig.update_layout(height=180, margin=dict(l=10, r=10, t=10, b=10), yaxis_range=[0, 100])
-    st.plotly_chart(rsi_fig, use_container_width=True)
-
-with st.expander("ℹ️ About this dashboard / how to extend it"):
+with tab_about:
     st.markdown(
         """
         **Data sources**
@@ -567,10 +712,13 @@ with st.expander("ℹ️ About this dashboard / how to extend it"):
         - Sector / industry / market cap basis / quarterly results: `fetch_company_info.py`
           → per-symbol NSE lookup, run occasionally (monthly) since this data changes
           rarely (NIFTY 500 scope — toggle "Universe" in the sidebar)
+        - Bonus/split back-adjustment: `fetch_corporate_actions.py` → whole-market bulk
+          fetch, run daily
 
         **Notes**
-        - 52-week High/Low are computed live from stored history (trailing 365
-          calendar days), not NSE's separate report.
+        - 52-week High/Low, moving averages, and RSI are back-adjusted for bonus/split
+          corporate actions so they stay comparable across time. The main table's
+          actual daily Open/High/Low/Close is never adjusted.
         - RSI here is a simple (non-Wilder-smoothed) 14-period RSI — fine for
           screening, not identical to every charting platform's exact number.
         - Market Cap is estimated as shares outstanding × close price — treat it

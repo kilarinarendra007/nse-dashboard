@@ -37,12 +37,14 @@ jobs:
         run: |
           python fetch_data.py
           python fetch_delivery.py
+          python fetch_corporate_actions.py
 
       - name: Backfill date range
         if: ${{ github.event.inputs.start_date != '' && github.event.inputs.end_date != '' }}
         run: |
           python fetch_data.py --start "${{ github.event.inputs.start_date }}" --end "${{ github.event.inputs.end_date }}"
           python fetch_delivery.py --start "${{ github.event.inputs.start_date }}" --end "${{ github.event.inputs.end_date }}"
+          python fetch_corporate_actions.py
 
       - name: Commit and push updated database
         run: |

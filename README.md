@@ -77,6 +77,15 @@ streamlit run app.py
 - Sector coverage depends on step 3 above and defaults to NIFTY 500 — stocks
   outside that won't show a sector until you widen `--index` or run it against
   a broader list.
+- 52-week High/Low, moving averages, and RSI are back-adjusted for bonus/split
+  corporate actions (`fetch_corporate_actions.py`), so a stock that did a
+  bonus/split in the last year won't show a stale, non-comparable pre-action
+  price as its "high." The main table's actual daily Open/High/Low/Close is
+  never adjusted — that always reflects the real price on that specific day.
+  This adjustment is best-effort text parsing of NSE's action descriptions;
+  anything it can't confidently parse is simply left unadjusted rather than
+  guessed at (run `python fetch_corporate_actions.py --debug` to see what
+  parsed vs. didn't).
 
 ## Adding more data later
 Each data source follows the same pattern: a small fetch script writing to its
