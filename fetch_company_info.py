@@ -86,16 +86,23 @@ def _find_all(obj, keywords, path=""):
 
 
 def _looks_like_junk(value) -> bool:
-    """Reject values that look like an internal index-name lookup (e.g.
-    'NIFTY AUTO                    ') rather than a genuine
-    sector/industry classification."""
+    """Reject values that look like an internal index-name lookup
+    ('NIFTY AUTO              '), an internal numeric ID, a boolean flag,
+    or anything else that isn't a genuine text classification."""
     if value is None:
+        return True
+    if isinstance(value, bool):
         return True
     s = str(value).strip()
     if not s or s == "-":
         return True
     if "NIFTY" in s.upper():
         return True
+    try:
+        float(s)
+        return True  # purely numeric — a real sector/industry name is always text
+    except ValueError:
+        pass
     return False
 
 
