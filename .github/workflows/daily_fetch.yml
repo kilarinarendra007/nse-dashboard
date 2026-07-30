@@ -2,6 +2,8 @@ name: Daily NSE data fetch
 
 on:
   schedule:
+    # 13:00 UTC = 18:30 IST, Mon-Fri. NSE bhavcopy is usually published
+    # by early evening IST, well before this runs.
     - cron: "0 13 * * 1-5"
   workflow_dispatch:
     inputs:
@@ -32,11 +34,15 @@ jobs:
 
       - name: Fetch today's data
         if: ${{ github.event.inputs.start_date == '' && github.event.inputs.end_date == '' }}
-        run: python fetch_data.py
+        run: |
+          python fetch_data.py
+          python fetch_delivery.py
 
       - name: Backfill date range
         if: ${{ github.event.inputs.start_date != '' && github.event.inputs.end_date != '' }}
-        run: python fetch_data.py --start "${{ github.event.inputs.start_date }}" --end "${{ github.event.inputs.end_date }}"
+        run: |
+          python fetch_data.py --start "${{ github.event.inputs.start_date }}" --end "${{ github.event.inputs.end_date }}"
+          python fetch_delivery.py --start "${{ github.event.inputs.start_date }}" --end "${{ github.event.inputs.end_date }}"
 
       - name: Commit and push updated database
         run: |

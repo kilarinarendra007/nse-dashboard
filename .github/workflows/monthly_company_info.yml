@@ -1,0 +1,48 @@
+name: Monthly sector/market-cap enrichment
+
+on:
+  schedule:
+    # First day of each month, 13:00 UTC. This data (sector, shares
+    # outstanding) changes rarely, so there's no need to run it daily —
+    # unlike the price/delivery fetches, this one is slow (one NSE
+    # request per symbol).
+    - cron: "0 13 1 * *"
+  workflow_dispatch:
+    inputs:
+      index:
+        description: "Which index's constituents to enrich (default: NIFTY 500)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch sector / market-cap-basis data
+        run: |
+          if [ -n "${{ github.event.inputs.index }}" ]; then
+            python fetch_company_info.py --index "${{ github.event.inputs.index }}"
+          else
+            python fetch_company_info.py
+          fi
+
+      - name: Commit and push updated company info
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/company_info.db
+          git diff --staged --quiet || git commit -m "Update company sector/market-cap info $(date -u +'%Y-%m-%d')"
+          git push

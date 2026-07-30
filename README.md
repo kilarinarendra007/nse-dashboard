@@ -1,63 +1,85 @@
 # NSE Dashboard
 
-A free, self-updating dashboard of all NSE-listed stocks: daily Open/High/Low/Close
-and rolling 52-week High/Low. Built to be extended later.
+A free, self-updating dashboard of all NSE-listed stocks: daily Open/High/Low/Close,
+rolling 52-week High/Low, Delivery %, VWAP, sector classification, market cap,
+moving averages/RSI, and a small screener.
 
 ## How it works
-- `fetch_data.py` downloads NSE's official daily "bhavcopy" report and stores it
-  in `data/nse_data_*.db` — one SQLite file per quarter, just plain files, no external database needed.
-- `.github/workflows/daily_fetch.yml` runs that script automatically every
-  weekday evening and commits the updated database back to this repo, for free,
-  using GitHub Actions.
-- `app.py` is a Streamlit dashboard that reads all the `data/nse_data_*.db` files and displays them,
-  computing 52-week high/low on the fly from stored history.
+
+| Script | What it fetches | Runs |
+|---|---|---|
+| `fetch_data.py` | Daily Open/High/Low/Close, volume, trades | Every weekday evening (GitHub Action) |
+| `fetch_delivery.py` | Delivery quantity/%, VWAP | Every weekday evening (same Action) |
+| `fetch_company_info.py` | Sector, industry, shares outstanding (for market cap) | Once a month (separate Action — this data changes rarely and the fetch is slow) |
+
+Prices and delivery data are stored as one SQLite file per **quarter**
+(`data/nse_data_2026Q1.db`, etc.) to stay under GitHub's 100MB per-file limit.
+Company info is stored in a single small file, `data/company_info.db`.
+
+`app.py` is a Streamlit dashboard that loads all of the above, merges them, and
+computes 52-week high/low, moving averages, and RSI live from stored history.
 
 ## One-time setup (10 minutes)
 
 ### 1. Put this project on GitHub
-Create a new repository on GitHub (public or private, either works) and upload
-all these files to it, keeping the folder structure as-is.
+Upload all these files to a GitHub repo, keeping the folder structure as-is
+(including the hidden `.github` folder).
 
-### 2. Turn on the automatic daily fetch
-GitHub Actions is already configured (`.github/workflows/daily_fetch.yml`) and
-needs no extra setup — it will start running automatically once the repo exists,
-on weekday evenings.
+### 2. Backfill daily price + delivery history
+1. Go to the **Actions** tab → **"Daily NSE data fetch"** → **Run workflow**
+2. Fill in `start_date` / `end_date` (e.g. a year back to today)
+3. Run it — takes a while since it fetches one day at a time
 
-To load **history** (needed for 52-week high/low to mean anything), trigger it once
-manually with a backfill:
-1. Go to the **Actions** tab in your GitHub repo
-2. Click **"Daily NSE data fetch"** in the left sidebar
-3. Click **"Run workflow"**
-4. Fill in `start_date` and `end_date`, e.g. `2025-08-01` to today
-5. Click **Run workflow**
+### 3. Populate sector / market cap (optional but recommended)
+1. Go to **Actions** → **"Monthly sector/market-cap enrichment"** → **Run workflow**
+2. Leave `index` blank for the default (NIFTY 500 constituents — covers the vast
+   majority of actively traded stocks; smaller/illiquid stocks won't have a
+   sector tag unless you widen this later)
+3. This is slower than the price fetch (one request per stock) — expect it to
+   take a while for ~500 symbols
 
-This will take a few minutes (it fetches one day at a time to be polite to NSE's
-servers). You can check progress under the Actions tab.
+**Note:** this script's field-lookup for sector/shares-outstanding is
+best-effort, since NSE doesn't officially document that response's exact
+shape. If the run reports "0 symbols had usable sector/shares data", run
+locally:
+```bash
+python fetch_company_info.py --debug RELIANCE
+```
+and share the printed output — the field lookup can be corrected from that.
 
-### 3. Deploy the dashboard (free)
-1. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with your
-   GitHub account
-2. Click **"New app"**
-3. Pick your repository, branch `main`, and main file path `app.py`
-4. Click **Deploy**
-
-That's it — you'll get a public URL for your dashboard. Every time the GitHub
-Action updates the `data/nse_data_*.db` files, the Streamlit app picks up the new data
-automatically (it refreshes every 10 minutes, or on redeploy).
+### 4. Deploy the dashboard (free)
+1. [share.streamlit.io](https://share.streamlit.io) → sign in with GitHub
+2. **Create app** → pick your repo, branch `main`, main file `app.py`
+3. Deploy
 
 ## Running locally (optional)
 ```bash
 pip install -r requirements.txt
-python fetch_data.py --start 2025-08-01 --end 2026-07-30   # one-time backfill
+python fetch_data.py --start 2025-08-01 --end 2026-07-30
+python fetch_delivery.py --start 2025-08-01 --end 2026-07-30
+python fetch_company_info.py
 streamlit run app.py
 ```
 
-## Adding more data later
-The database is a plain SQLite file with one table, `daily_prices`. To add new
-data (indices, F&O, delivery %, sector/fundamental info, etc.):
-1. Write a new fetch function (following the pattern in `fetch_data.py`) that
-   writes to a new table
-2. Add a new section to `app.py` to display it
-3. Optionally add a step to the GitHub Action to run your new fetch function
+## What's in the dashboard
+- **Main table**: every stock, Open/High/Low/Close, % change, 52W high/low,
+  Delivery %, VWAP, SMA20/50/200, RSI(14), sector, estimated market cap
+- **Filters**: series, sector, specific symbols, as-of date
+- **Screener**: Top Gainers/Losers, Near 52W High/Low, High Delivery %,
+  Oversold/Overbought (RSI)
+- **Symbol drill-down**: price chart with moving averages + a separate RSI panel
 
-This structure is intentionally simple so extending it is additive, not a rewrite.
+## Caveats worth knowing
+- RSI is a simple (non-Wilder-smoothed) 14-period calculation — good enough for
+  screening, but won't exactly match every charting platform's number.
+- Market Cap = shares outstanding × close price — an estimate, not
+  exchange-verified.
+- Sector coverage depends on step 3 above and defaults to NIFTY 500 — stocks
+  outside that won't show a sector until you widen `--index` or run it against
+  a broader list.
+
+## Adding more data later
+Each data source follows the same pattern: a small fetch script writing to its
+own table, plus a loader function in `app.py` that gets merged into the main
+table. To add something new (F&O data, index membership, corporate actions,
+etc.), follow that same shape — it's additive, not a rewrite.
