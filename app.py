@@ -252,13 +252,24 @@ def compute_technical_snapshot(df: pd.DataFrame, as_of: pd.Timestamp) -> pd.Data
     return latest[["symbol", "series", "sma20", "sma50", "sma200", "rsi14"]]
 
 
-def compute_results_trend(results: pd.DataFrame) -> pd.DataFrame:
+def compute_results_trend(results: pd.DataFrame, reference_date: pd.Timestamp) -> pd.DataFrame:
     """Per symbol: latest quarter's net profit, QoQ % change, YoY % change
     (vs. the same quarter a year ago, i.e. 4 quarters back), and a
     Positive/Negative tag. YoY is preferred for the tag since it avoids
     seasonal noise; falls back to QoQ if a full year of history isn't
-    stored yet."""
-    cols = ["symbol", "latest_quarter_end", "latest_net_profit_cr", "qoq_change_pct", "yoy_change_pct", "results_trend"]
+    stored yet.
+
+    Also flags results older than ~200 days as possibly stale — NSE's
+    own results-comparison endpoint has a known tendency to serve an
+    outdated snapshot for some symbols (confirmed independently against
+    NSE's own public page, not just this app), so it's worth surfacing
+    rather than silently presenting an old quarter as if it were current.
+    """
+    STALE_THRESHOLD_DAYS = 200
+    cols = [
+        "symbol", "latest_quarter_end", "latest_net_profit_cr",
+        "qoq_change_pct", "yoy_change_pct", "results_trend",
+    ]
     if results.empty:
         return pd.DataFrame(columns=cols)
 
@@ -307,9 +318,14 @@ def compute_results_trend(results: pd.DataFrame) -> pd.DataFrame:
         else:
             trend = None
 
+        age_days = (reference_date - latest["quarter_end_dt"]).days
+        quarter_end_display = str(latest["quarter_end"])
+        if age_days > STALE_THRESHOLD_DAYS:
+            quarter_end_display += " ⚠️"
+
         return pd.Series(
             {
-                "latest_quarter_end": latest["quarter_end"],
+                "latest_quarter_end": quarter_end_display,
                 "latest_net_profit_cr": round(latest["net_profit_lakhs"] / 100, 1)
                 if pd.notna(latest["net_profit_lakhs"])
                 else None,
@@ -399,7 +415,6 @@ def style_table(df: pd.DataFrame):
     one_decimal_cols = [c for c in ["Delivery %", "RSI(14)"] if c in df.columns]
     cr_cols = [c for c in ["Market Cap (Cr)", "Last Qtr Net Profit (Cr)"] if c in df.columns]
     large_count_cols = [c for c in ["Volume", "Trades"] if c in df.columns]
-    date_cols = [c for c in ["Last Qtr End"] if c in df.columns]
 
     fmt = {}
     for c in pct_cols + one_decimal_cols:
@@ -410,10 +425,6 @@ def style_table(df: pd.DataFrame):
         fmt[c] = "{:,.1f}"
     for c in large_count_cols:
         fmt[c] = format_indian_large_number
-    for c in date_cols:
-        fmt[c] = lambda v: v.strftime("%d %b %Y") if pd.notna(v) and hasattr(v, "strftime") else (
-            pd.to_datetime(v).strftime("%d %b %Y") if pd.notna(v) else ""
-        )
 
     styler = df.style.format(fmt, na_rep="—")
     style_fn = styler.map if hasattr(styler, "map") else styler.applymap
@@ -589,7 +600,7 @@ else:
     day_df["market_cap_cr"] = None
 
 # Quarterly results trend
-results_trend = compute_results_trend(quarterly_results)
+results_trend = compute_results_trend(quarterly_results, as_of)
 day_df = day_df.merge(results_trend, on="symbol", how="left")
 
 if sector_filter:
@@ -666,6 +677,13 @@ tab_overview, tab_leaders, tab_screener, tab_chart, tab_about = st.tabs(
 
 with tab_overview:
     st.subheader(f"All {len(table)} stocks — {as_of.strftime('%d %b %Y')}")
+    if table["Last Qtr End"].astype(str).str.contains("⚠️").any():
+        st.caption(
+            "⚠️ next to a quarter date means NSE's results data for that stock looks "
+            "unusually old (verified independently against NSE's own site) — likely a "
+            "data-lag issue on their end for this specific report, not necessarily a real "
+            "reporting gap by the company."
+        )
     st.dataframe(style_table(table), use_container_width=True, height=500)
 
     st.download_button(

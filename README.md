@@ -10,7 +10,16 @@ moving averages/RSI, and a small screener.
 |---|---|---|
 | `fetch_data.py` | Daily Open/High/Low/Close, volume, trades | Every weekday evening (GitHub Action) |
 | `fetch_delivery.py` | Delivery quantity/%, VWAP | Every weekday evening (same Action) |
-| `fetch_company_info.py` | Sector, industry, shares outstanding (for market cap) | Once a month (separate Action — this data changes rarely and the fetch is slow) |
+| `fetch_corporate_actions.py` | Bonus/split events (for back-adjusting historical prices) | Every weekday evening (same Action) |
+| `fetch_company_info.py` | Sector/industry/market cap basis (NSE) + quarterly revenue/net profit (**BSE**) | Once a month (separate Action — slow, this data changes rarely) |
+
+**Why BSE for quarterly results, not NSE:** NSE's own results endpoint was found to
+serve stale/frozen data for some symbols — e.g. showing a company's latest quarter
+as over a year old despite them having clearly reported more recently. BSE (a
+completely separate data pipeline) was verified to show genuinely current
+quarters, so it's used as the primary source, with NSE as a fallback if BSE has
+no data for a given symbol. Any quarter more than ~200 days old still gets a ⚠️
+in the dashboard regardless of source, since staleness can in principle recur.
 
 Prices and delivery data are stored as one SQLite file per **quarter**
 (`data/nse_data_2026Q1.db`, etc.) to stay under GitHub's 100MB per-file limit.
